@@ -1,0 +1,14 @@
+{
+  "name": "ntfy-agent",
+  "owner": { "name": "Prog-Jacob" },
+  "description": "Push a notification to your phone when a coding agent finishes a turn or needs your input.",
+  "plugins": [
+    {
+      "name": "ntfy-agent",
+      "source": "./",
+      "description": "Notify your phone when Claude Code finishes a turn or needs your input.",
+      "category": "notifications",
+      "tags": ["notifications", "ntfy", "push", "mobile"]
+    }
+  ]
+}

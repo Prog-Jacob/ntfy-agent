@@ -1,0 +1,55 @@
+{
+  "name": "ntfy-agent",
+  "description": "Notify your phone when Claude Code finishes a turn or needs your input.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Prog-Jacob"
+  },
+  "homepage": "https://github.com/Prog-Jacob/ntfy-agent",
+  "license": "MIT",
+  "keywords": [
+    "notifications",
+    "ntfy",
+    "push",
+    "mobile",
+    "hooks"
+  ],
+  "hooks": "./hooks/hooks.json",
+  "userConfig": {
+    "urls": {
+      "type": "string",
+      "title": "Destinations",
+      "description": "Where to send. ntfy://<topic> for ntfy.sh (a random topic acts as the password), or pover://user@token, tgram://token/chat, gotify://token@host, discord://id/token, slack://path, https://your-webhook. Comma separated for several. Leave blank to fall back to the config file.",
+      "sensitive": true,
+      "required": false
+    },
+    "desktop": {
+      "type": "string",
+      "title": "Desktop banner",
+      "description": "Also show a desktop banner: auto (skips SSH, CI and headless), always, or never.",
+      "default": "auto",
+      "required": false
+    },
+    "min_seconds": {
+      "type": "string",
+      "title": "Minimum turn length",
+      "description": "Skip finished-turn notifications for turns shorter than this many seconds. Permission prompts always get through.",
+      "default": "60",
+      "required": false
+    },
+    "quiet_hours": {
+      "type": "string",
+      "title": "Quiet hours",
+      "description": "Mute finished-turn notifications during this local-time window, e.g. 23:00-07:00. Blank disables. A blocked agent still notifies.",
+      "default": "",
+      "required": false
+    },
+    "body": {
+      "type": "string",
+      "title": "Message body",
+      "description": "summary sends the agent's last message. none sends only the title, keeping code and paths off a third-party server.",
+      "default": "summary",
+      "required": false
+    }
+  }
+}

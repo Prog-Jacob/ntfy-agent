@@ -1,0 +1,37 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 10,
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/ntfy-agent\" hook claude start"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 10,
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/ntfy-agent\" hook claude stop"
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 10,
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/ntfy-agent\" hook claude notification"
+          }
+        ]
+      }
+    ]
+  }
+}
