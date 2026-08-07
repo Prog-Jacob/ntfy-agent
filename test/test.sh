@@ -11,8 +11,11 @@ BIN="$ROOT/bin/ntfy-agent"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT INT TERM
 
-PASS=0 FAIL=0
+PASS=0 FAIL=0 SKIP=0
 HAVE_JQ=no; command -v jq >/dev/null 2>&1 && HAVE_JQ=yes
+# Git Bash emulates POSIX modes over NTFS, so a few assertions cannot hold there.
+IS_WINDOWS=no
+case "$(uname -s 2>/dev/null)" in MINGW*|MSYS*|CYGWIN*) IS_WINDOWS=yes ;; esac
 
 # Isolate every run from the real machine.
 export XDG_CONFIG_HOME="$TMP/config"
@@ -31,6 +34,7 @@ export NTFY_AGENT_MIN_SECONDS=0
 export NTFY_AGENT_DEBOUNCE_SECONDS=0
 
 ok()  { PASS=$((PASS + 1)); printf '  ok   %s\n' "$1"; }
+skip() { SKIP=$((SKIP + 1)); printf '  skip %s\n       %s\n' "$1" "$2"; }
 bad() {
   FAIL=$((FAIL + 1))
   printf '  FAIL %s\n' "$1"
@@ -393,9 +397,10 @@ r=$(fire claude stop '{"session_id":"p1","cwd":"/tmp/p","last_assistant_message"
 missing "the exported env URL wins over the file" "FROM_FILE" "$r"
 : >"$SINK"
 # With no env override present, the file's value must take effect.
-r=$(env -u NTFY_AGENT_URLS sh -c "printf '%s' '{\"session_id\":\"p2\",\"cwd\":\"/tmp/p\"}' | \
-  \"$BIN\" hook claude stop; sleep 0.5; cat \"$SINK\"")
-contains "the file is used when the env is unset" "FROM_FILE" "$r"
+env -u NTFY_AGENT_URLS sh -c "printf '%s' '{\"session_id\":\"p2\",\"cwd\":\"/tmp/p\"}' | \
+  \"$BIN\" hook claude stop"
+await "$SINK"
+contains "the file is used when the env is unset" "FROM_FILE" "$(cat "$SINK")"
 rm -f "$conf"
 reset_state
 
@@ -409,10 +414,13 @@ say "Claude Code plugin options"
 # The plugin exports CLAUDE_PLUGIN_OPTION_<KEY>; ${user_config.*} is rejected in
 # shell-form hook commands, so the environment is the only supported route.
 PLUGIN_URLS="cmd://printf 'VIA_PLUGIN\n' >>\"$SINK\""
-r=$(env -u NTFY_AGENT_URLS CLAUDE_PLUGIN_OPTION_URLS="$PLUGIN_URLS" \
+# await only waits while the sink is empty, so it has to start empty.
+: >"$SINK"
+env -u NTFY_AGENT_URLS CLAUDE_PLUGIN_OPTION_URLS="$PLUGIN_URLS" \
   sh -c "printf '%s' '{\"session_id\":\"pl1\",\"cwd\":\"/tmp/p\"}' | \
-    \"$BIN\" hook claude stop; sleep 0.5; cat \"$SINK\"")
-contains "a plugin option supplies the destination" "VIA_PLUGIN" "$r"
+    \"$BIN\" hook claude stop"
+await "$SINK"
+contains "a plugin option supplies the destination" "VIA_PLUGIN" "$(cat "$SINK")"
 : >"$SINK"
 reset_state
 
@@ -532,8 +540,13 @@ say "setup, status, doctor"
 out=$("$BIN" setup 2>&1)
 contains "setup writes a config" "Wrote" "$out"
 contains "setup tells the user the topic is a password" "password" "$out"
-mode=$(stat -c '%a' "$conf" 2>/dev/null || stat -f '%Lp' "$conf" 2>/dev/null)
-check "the config is created mode 600, never chmod-ed after" 600 "$mode"
+if [ "$IS_WINDOWS" = yes ]; then
+  skip "the config is created mode 600, never chmod-ed after" \
+    "Git Bash reports 644 whatever the umask, so the topic cannot be hidden here"
+else
+  mode=$(stat -c '%a' "$conf" 2>/dev/null || stat -f '%Lp' "$conf" 2>/dev/null)
+  check "the config is created mode 600, never chmod-ed after" 600 "$mode"
+fi
 t1=$(sed -n 's/^NTFY_AGENT_URLS="ntfy:\/\/\(.*\)"$/\1/p' "$conf")
 assert "the generated topic is long enough to be unguessable" test "${#t1}" -ge 20
 rm -f "$conf"
@@ -807,9 +820,13 @@ reset_state
 say "the payload reader does not depend on jq"
 # Without jq the fallback extractor runs. It used GNU-only sed alternation,
 # which matched nothing on BSD sed, so every field came back empty on macOS.
+# Wrappers, not symlinks: Git Bash copies, and an MSYS binary copied away from
+# the DLL beside it cannot run.
 NOJQ="$TMP/nojq"; mkdir -p "$NOJQ"
 for t in sh awk sed tr cat date printf grep mkdir rm cut basename git stat ls uname find; do
-  p=$(command -v $t 2>/dev/null) && ln -sf "$p" "$NOJQ/$t" 2>/dev/null
+  p=$(command -v "$t" 2>/dev/null) || continue
+  printf '#!/bin/sh\nexec "%s" "$@"\n' "$p" >"$NOJQ/$t"
+  chmod 755 "$NOJQ/$t"
 done
 r=$(fire claude stop \
   '{"session_id":"nj","cwd":"/tmp/proj","last_assistant_message":"read without jq"}' \
@@ -1004,5 +1021,6 @@ check "an error page is not installed as a script" 1 $?
 
 # --------------------------------------------------------------------------
 printf '\n%s\n' "----------------------------------------"
-printf 'passed %s, failed %s\n' "$PASS" "$FAIL"
+printf 'passed %s, failed %s%s\n' "$PASS" "$FAIL" \
+  "$([ "$SKIP" = 0 ] || printf ', skipped %s' "$SKIP")"
 [ "$FAIL" = 0 ] || exit 1
