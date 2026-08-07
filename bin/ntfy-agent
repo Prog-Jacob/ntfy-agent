@@ -1351,7 +1351,9 @@ cmd_doctor() {
      test -n "$NTFY_AGENT_URLS"
 
   if [ -f "$CONF" ]; then
-    perms=$(stat -f '%Lp' "$CONF" 2>/dev/null || stat -c '%a' "$CONF" 2>/dev/null)
+    # GNU first: BSD stat rejects -c, but GNU stat reads -f as "the filesystem"
+    # and exits 0 with something that is not a mode.
+    perms=$(stat -c '%a' "$CONF" 2>/dev/null || stat -f '%Lp' "$CONF" 2>/dev/null)
     case "$perms" in
       600|400) printf '  ok    config is not readable by others\n' ;;
       '') warn "cannot read config permissions" "check \"$CONF\" by hand" ;;

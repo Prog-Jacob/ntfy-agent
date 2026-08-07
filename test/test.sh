@@ -532,7 +532,7 @@ say "setup, status, doctor"
 out=$("$BIN" setup 2>&1)
 contains "setup writes a config" "Wrote" "$out"
 contains "setup tells the user the topic is a password" "password" "$out"
-mode=$(stat -f '%Lp' "$conf" 2>/dev/null || stat -c '%a' "$conf" 2>/dev/null)
+mode=$(stat -c '%a' "$conf" 2>/dev/null || stat -f '%Lp' "$conf" 2>/dev/null)
 check "the config is created mode 600, never chmod-ed after" 600 "$mode"
 t1=$(sed -n 's/^NTFY_AGENT_URLS="ntfy:\/\/\(.*\)"$/\1/p' "$conf")
 assert "the generated topic is long enough to be unguessable" test "${#t1}" -ge 20
