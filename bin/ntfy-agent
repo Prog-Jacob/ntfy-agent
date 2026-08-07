@@ -1,0 +1,1469 @@
+#!/bin/sh
+# ntfy-agent: push a notification to your phone when a coding agent finishes
+# a turn or needs your input. One POSIX script, no runtime, no daemon.
+#
+# Design notes worth knowing before editing:
+#   * Hook handlers MUST print nothing and MUST exit 0. Agents interpret other
+#     exit codes, and the worst reading is Gemini CLI's: anything other than 0
+#     or 1 becomes decision:"deny". Exit 2 also blocks on Claude Code's Stop and
+#     UserPromptSubmit, on Cursor, and on Codex. It is ignored on Claude's
+#     Notification hook and is only a warning on Copilot's agentStop, but the
+#     handler is shared, so it holds to the strictest of them. A notifier that
+#     denies the agent is far worse than no notifier.
+#   * Sending happens in a detached subshell so a hung network call can never
+#     stall the agent.
+#   * Never parse a transcript. Every agent with a "turn finished" event also
+#     puts the final assistant text in the hook payload, and the docs warn the
+#     transcript file lags behind.
+#
+# shellcheck disable=SC3043  # `local` is not POSIX but works in dash/ash/bash/zsh
+
+VERSION=0.1.0
+
+# A bare newline, so a list can be split on lines only. Written once because the
+# literal form spans two lines and appeared in three functions.
+NL='
+'
+
+SELF=$0
+case "$SELF" in
+  */*) ;;
+  *) SELF=$(command -v "$0" 2>/dev/null || echo "$0") ;;
+esac
+case "$SELF" in /*) ;; *) SELF="$PWD/${SELF#./}" ;; esac
+
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/ntfy-agent"
+CONF="$CONF_DIR/config"
+# One location, whatever wired the hook. CLAUDE_PLUGIN_DATA is exported to the
+# plugin's hook and nothing else, so keying state on it hid a snooze from that
+# hook and gave a doubly-wired machine two debounce windows.
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/ntfy-agent"
+# Holds the URL and any token for the request in flight. PID-scoped, so
+# transports within one send reuse it serially and concurrent hooks do not
+# collide. The EXIT trap on the __send path removes it if curl is killed.
+REQ_CFG="$STATE/req.$$"
+
+# ---------------------------------------------------------------- config ----
+
+# Emitted one per line rather than held in a variable: zsh does not word-split
+# an unquoted parameter, but every shell splits command substitution.
+conf_keys() {
+  printf '%s\n' URLS DESKTOP EVENTS MIN_SECONDS DEBOUNCE_SECONDS MAX_BODY \
+    BODY QUIET_HOURS CLICK TIMEOUT
+}
+
+# The numeric settings, which are the ones a hand-edited file can break.
+num_keys() { printf '%s\n' MIN_SECONDS DEBOUNCE_SECONDS MAX_BODY TIMEOUT; }
+
+# Defaults chosen so a fresh install is useful after answering one question.
+# These are applied inside load_config, after the environment is snapshotted:
+# assigning them at top level would clobber the caller's exported values.
+set_defaults() {
+  local k
+  NTFY_AGENT_URLS=""
+  NTFY_AGENT_DESKTOP=auto        # auto | always | never
+  NTFY_AGENT_EVENTS="done,needs_input"
+  NTFY_AGENT_MIN_SECONDS=60      # skip turns you never looked away from
+  NTFY_AGENT_DEBOUNCE_SECONDS=30 # collapse a burst into one buzz, per session
+  NTFY_AGENT_MAX_BODY=300
+  NTFY_AGENT_BODY=summary        # summary | none (none = title only, private)
+  NTFY_AGENT_QUIET_HOURS=""      # e.g. 23:00-07:00, local time
+  NTFY_AGENT_CLICK=""            # e.g. vscode://file{cwd}; {cwd} {session} {agent}
+  NTFY_AGENT_TIMEOUT=5
+  # Remembered here rather than written twice, so a default has one home.
+  for k in $(num_keys); do eval "_default_$k=\$NTFY_AGENT_$k"; done
+}
+
+load_config() {
+  # Precedence: environment > config file > defaults.
+  local k v
+  # Presence, not emptiness: NTFY_AGENT_QUIET_HOURS="" has to be able to turn
+  # off a window set in the config file.
+  for k in $(conf_keys); do
+    eval "set_flag=\${NTFY_AGENT_$k+set}"
+    [ "${set_flag:-}" = set ] || continue
+    eval "v=\${NTFY_AGENT_$k}"
+    eval "_env_$k=\"\$v\""
+    eval "_have_$k=set"
+  done
+  set_defaults
+  # The config file is shell, and it is user-editable. Sourcing it directly let
+  # an `exit 3` in it become the hook's exit code and a stray quote abort the
+  # script outright with dash's exit 2, which is the code that blocks the turn.
+  # Evaluate it in a subshell and read back only the settings, so nothing in
+  # that file can steer this process.
+  if [ -f "$CONF" ]; then
+    _conf_dump=$(
+      # shellcheck disable=SC1090
+      . "$CONF" >/dev/null 2>&1
+      for k in $(conf_keys); do
+        eval "v=\${NTFY_AGENT_$k:-}"
+        printf '%s=%s\n' "$k" "$(printf '%s' "$v" | tr -d '\n')"
+      done
+    ) 2>/dev/null
+    _oldifs=$IFS; IFS=$NL
+    for line in $_conf_dump; do
+      IFS=$_oldifs
+      k=${line%%=*}
+      v=${line#*=}
+      # The dump already reads "file value, or default", so assigning an empty
+      # one is how QUIET_HOURS="" in the file turns a window back off.
+      case " $(conf_keys | tr '\n' ' ') " in
+        *" $k "*) eval "NTFY_AGENT_$k=\$v" ;;
+      esac
+      IFS=$NL
+    done
+    IFS=$_oldifs
+  fi
+  for k in $(conf_keys); do
+    eval "set_flag=\${_have_$k:-}"
+    [ "$set_flag" = set ] || continue
+    eval "v=\${_env_$k:-}"
+    eval "NTFY_AGENT_$k=\"\$v\""
+  done
+  # Claude Code plugin options. It exports each userConfig value as
+  # CLAUDE_PLUGIN_OPTION_<KEY>, and deliberately refuses to substitute
+  # ${user_config.*} into a shell-form hook command, so the environment is the
+  # only supported route. These sit above the file but below a real env var,
+  # including an exported URLS="" which is a deliberate "send nowhere".
+  for k in $(conf_keys); do
+    eval "set_flag=\${_have_$k:-}"
+    [ "$set_flag" = set ] && continue
+    eval "v=\${CLAUDE_PLUGIN_OPTION_$k:-}"
+    [ -n "$v" ] && eval "NTFY_AGENT_$k=\"\$v\""
+  done
+
+  # A hand-edited file can hold anything. Fall back to the default rather than
+  # letting a bad value silently disable a gate or truncate to nothing.
+  for k in $(num_keys); do
+    eval "v=\${NTFY_AGENT_$k}"
+    is_num "$v" || eval "NTFY_AGENT_$k=\$_default_$k"
+  done
+}
+
+# ------------------------------------------------------------------ util ----
+
+die() { printf 'ntfy-agent: %s\n' "$*" >&2; exit 1; }
+say() { printf '%s\n' "$*"; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# Set by cmd_setup, not tested here: `urls=$(ask ...)` puts stdout on a pipe,
+# so a -t 1 inside ask would always be false.
+INTERACTIVE=0
+interactive() { [ "$INTERACTIVE" = 1 ]; }
+
+# ask <prompt> <default>. Empty input, or no terminal, gives the default, so an
+# unanswered prompt lands exactly where never asking would have.
+ask() {
+  local reply
+  interactive || { printf '%s\n' "$2"; return 0; }
+  if [ -n "$2" ]; then printf '%s [%s]: ' "$1" "$2" >&2
+  else printf '%s: ' "$1" >&2
+  fi
+  IFS= read -r reply </dev/tty || reply=""
+  printf '%s\n' "${reply:-$2}"
+}
+
+confirm() { case "$(ask "$1" "$2")" in [Nn]*) return 1 ;; esac; }
+
+is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac; }
+
+# Strip control characters and collapse whitespace. HTTP header values cannot
+# contain newlines, and an agent's last message very often does.
+oneline() {
+  tr '\n\r\t' '   ' | tr -d '\000-\010\013\014\016-\037' \
+    | sed 's/  */ /g; s/^ //; s/ *$//'
+}
+
+PAYLOAD=""
+# Read one flat top-level JSON string field out of $PAYLOAD.
+jget() {
+  [ -n "$PAYLOAD" ] || return 0
+  if have jq; then
+    printf '%s' "$PAYLOAD" | jq -r --arg k "$1" '.[$k] // empty' 2>/dev/null
+    return 0
+  fi
+  # ponytail: strings are consumed whole and brace depth tracked, so a key name
+  # nested in an object or sitting inside a value cannot be mistaken for the
+  # real one. Non-string values read as empty; no payload field needs them.
+  printf '%s' "$PAYLOAD" | awk -v key="$1" '
+    function hexval(s,    i, v, d) {
+      v = 0
+      for (i = 1; i <= length(s); i++) {
+        d = index("0123456789abcdef", tolower(substr(s, i, 1))) - 1
+        if (d < 0) return -1
+        v = v * 16 + d
+      }
+      return v
+    }
+    # Decode the JSON string whose opening quote is at s[i]. Leaves the text in
+    # STR, returns the index just past the closing quote.
+    function readstr(s, i, n,    out, c, e, v) {
+      out = ""
+      i++
+      while (i <= n) {
+        c = substr(s, i, 1)
+        if (c == "\\") {
+          e = substr(s, i + 1, 1)
+          if (e == "n" || e == "t" || e == "r") out = out " "
+          else if (e == "u") {
+            # Six characters counting the backslash. ASCII only: awk printf
+            # %c disagrees across awks above 0x7f, and agents send raw UTF-8.
+            v = hexval(substr(s, i + 2, 4))
+            if (v >= 32 && v < 127) out = out sprintf("%c", v)
+            else if (v == 9 || v == 10 || v == 13) out = out " "
+            i += 6
+            continue
+          }
+          else out = out e
+          i += 2
+          continue
+        }
+        if (c == "\"") { i++; break }
+        out = out c
+        i++
+      }
+      STR = out
+      return i
+    }
+    { rec = rec sep $0; sep = "\n" }
+    END {
+      n = length(rec)
+      i = 1
+      while (i <= n) {
+        c = substr(rec, i, 1)
+        if (c == "{" || c == "[") { depth++; i++; continue }
+        if (c == "}" || c == "]") { depth--; i++; continue }
+        if (c != "\"") { i++; continue }
+        j = readstr(rec, i, n)
+        k = STR
+        while (j <= n && substr(rec, j, 1) ~ /[ \t\n\r]/) j++
+        # Not followed by a colon, so that was a value, not a key.
+        if (substr(rec, j, 1) != ":") { i = j; continue }
+        j++
+        while (j <= n && substr(rec, j, 1) ~ /[ \t\n\r]/) j++
+        if (depth == 1 && k == key) {
+          if (substr(rec, j, 1) == "\"") { readstr(rec, j, n); print STR }
+          exit
+        }
+        i = j
+      }
+    }'
+}
+
+# Drop leading zeros so a value is safe to use in POSIX arithmetic, where a
+# leading zero means octal and `08` is an error.
+strip0() {
+  local v
+  v=$(printf '%s' "$1" | sed 's/^0*//')
+  printf '%s' "${v:-0}"
+}
+
+# Telegram's parse_mode=HTML. Its only inputs are $TITLE and $BODY, both
+# already flattened to one line by then, so sed is enough.
+html_escape() {
+  printf '%s' "$1" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'
+}
+
+# Escape a string for use inside a JSON double-quoted value. awk, because BSD
+# sed's `N` quits without printing on the last line, which made the previous sed
+# version return an empty string for all single-line input.
+# Lines are joined in END because RS="\0" is zero-length, which every awk reads
+# as paragraph mode, so blank lines were dropped rather than encoded.
+json_escape() {
+  awk '
+    { rec = rec sep $0; sep = "\n" }
+    END {
+      gsub(/\\/, "\\\\", rec)
+      gsub(/"/, "\\\"", rec)
+      gsub(/\n/, "\\n", rec)
+      gsub(/\r/, "\\r", rec)
+      gsub(/\t/, "\\t", rec)
+      # Any remaining C0 control byte is illegal raw inside a JSON string and
+      # would make the whole body unparseable for the receiver.
+      gsub(/[\001-\010\013\014\016-\037]/, "?", rec)
+      printf "%s", rec
+    }'
+}
+
+# One-argument forms of the two filters, since every call site had the same
+# `printf '%s' "$x" |` prefix.
+jesc() { printf '%s' "$1" | json_escape; }
+one() { printf '%s' "$1" | oneline; }
+
+# Truncate to a character count. `cut -c` counts bytes on GNU and under LC_ALL=C,
+# which splits a multibyte character and emits invalid UTF-8 into a header.
+truncate_chars() {
+  awk -v n="$1" '
+    { rec = rec sep $0; sep = "\n" }
+    END {
+      # substr counts bytes on BSD awk whatever the locale, so walk the string
+      # and count UTF-8 lead bytes instead. Cutting mid-character would put an
+      # invalid byte into an HTTP header or a JSON body.
+      chars = 0
+      len = length(rec)
+      for (i = 1; i <= len; i++) {
+        c = substr(rec, i, 1)
+        # Continuation bytes are 0x80-0xBF and do not start a new character.
+        if (c >= "\200" && c <= "\277") continue
+        chars++
+        if (chars > n) { printf "%s", substr(rec, 1, i - 1); exit }
+      }
+      printf "%s", rec
+    }'
+}
+
+
+# ------------------------------------------------------------ environment ----
+
+is_remote() {
+  [ -n "${SSH_CONNECTION:-}${SSH_CLIENT:-}${SSH_TTY:-}" ] && return 0
+  [ -n "${CI:-}" ] && return 0
+  return 1
+}
+
+is_wsl() {
+  [ -n "${WSL_DISTRO_NAME:-}" ] && return 0
+  grep -qi microsoft /proc/version 2>/dev/null
+}
+
+platform() {
+  case "$(uname -s 2>/dev/null)" in
+    Darwin) echo macos ;;
+    MINGW*|MSYS*|CYGWIN*) echo windows ;;
+    *) if is_wsl; then echo windows; else echo linux; fi ;;
+  esac
+}
+
+# Is there a notification daemon here that would actually show the user a
+# banner? `always` skips the environment checks but not the missing-binary one,
+# so it can still turn out there is nothing to call.
+desktop_ok() {
+  [ "$NTFY_AGENT_DESKTOP" = never ] && return 1
+  if [ "$NTFY_AGENT_DESKTOP" != always ]; then
+    is_remote && return 1
+    [ "$(platform)" = linux ] && [ -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && return 1
+  fi
+  case "$(platform)" in
+    macos) have osascript ;;
+    windows) have powershell.exe || have powershell ;;
+    linux) have notify-send ;;
+  esac
+}
+
+# --------------------------------------------------------------- gating ----
+
+# Exactly what within_quiet_hours can act on: a dash with digits either side.
+valid_window() {
+  local f t
+  case "$1" in *-*) ;; *) return 1 ;; esac
+  case "$1" in *[!0-9:-]*) return 1 ;; esac
+  f=$(printf '%s' "${1%%-*}" | tr -cd '0-9')
+  t=$(printf '%s' "${1##*-}" | tr -cd '0-9')
+  [ -n "$f" ] && [ -n "$t" ]
+}
+
+within_quiet_hours() {
+  [ -n "$NTFY_AGENT_QUIET_HOURS" ] || return 1
+  local from to now
+  from=$(printf '%s' "${NTFY_AGENT_QUIET_HOURS%%-*}" | tr -cd '0-9')
+  to=$(printf '%s' "${NTFY_AGENT_QUIET_HOURS##*-}" | tr -cd '0-9')
+  now=$(date +%H%M)
+  [ -n "$from" ] && [ -n "$to" ] || return 1
+  # Strip leading zeros before any arithmetic: `08` is an invalid octal literal,
+  # and $((10#..)) is a bashism this script cannot rely on.
+  from=$(strip0 "$from"); to=$(strip0 "$to"); now=$(strip0 "$now")
+  if [ "$from" -le "$to" ]; then
+    [ "$now" -ge "$from" ] && [ "$now" -lt "$to" ]
+  else
+    # Window wraps past midnight.
+    [ "$now" -ge "$from" ] || [ "$now" -lt "$to" ]
+  fi
+}
+
+snoozed() {
+  local until
+  until=$(cat "$STATE/snooze" 2>/dev/null) || return 1
+  [ -n "$until" ] && [ "$(date +%s)" -lt "$until" ]
+}
+
+event_enabled() {
+  case ",$NTFY_AGENT_EVENTS," in *",$1,"*) return 0 ;; esac
+  return 1
+}
+
+# One notification per window per (session, event). Keyed on session so two
+# projects running in parallel cannot silence each other.
+#
+# needs_input gets a 5 second floor rather than the full window: a blocked agent
+# is the entire reason this tool exists, and approving one prompt only to have
+# the next one arrive silently is the exact failure it is meant to prevent. The
+# floor is still enough to collapse the Notification-then-Stop double fire.
+debounced() {
+  local stamp last now window
+  window=$NTFY_AGENT_DEBOUNCE_SECONDS
+  [ "$2" = needs_input ] && [ "$window" -gt 5 ] && window=5
+  stamp=$(state_path debounce "$1-$2")
+  now=$(date +%s)
+  # Claim the window before reading it. mkdir is atomic, so when the plugin and
+  # a hand-wired hook both fire for one event, exactly one of them proceeds.
+  if ! mkdir "$stamp.lock" 2>/dev/null; then
+    # The trap below releases the lock on a signal, but not on SIGKILL or a hard
+    # agent timeout. A directory left that way would mute this session forever,
+    # so anything that outlived every agent's hook timeout is reclaimed. mkdir
+    # set the mtime, so no bookkeeping file is needed.
+    [ -n "$(find "$stamp.lock" -maxdepth 0 -mmin +1 2>/dev/null)" ] || return 0
+    rm -rf "$stamp.lock" 2>/dev/null
+    mkdir "$stamp.lock" 2>/dev/null || return 0
+  fi
+  trap 'rmdir "$stamp.lock" 2>/dev/null' EXIT INT TERM HUP
+  last=$(cat "$stamp" 2>/dev/null || echo 0)
+  is_num "$last" || last=0
+  if [ "$((now - last))" -lt "$window" ]; then
+    rmdir "$stamp.lock" 2>/dev/null; trap - EXIT INT TERM HUP
+    return 0
+  fi
+  printf '%s' "$now" >"$stamp" 2>/dev/null
+  rmdir "$stamp.lock" 2>/dev/null; trap - EXIT INT TERM HUP
+  return 1
+}
+
+# ------------------------------------------------------------ transports ----
+
+# All HTTP goes through here. Two rules, both learned the hard way:
+#
+#  * The body is always fed on stdin as `@-`, never as an argument value. For
+#    curl's -d/--data-binary and -F, a value beginning with @ means "read this
+#    file", and the body is agent-controlled text. An assistant message of
+#    "@/etc/passwd" would otherwise POST that file to the notification server.
+#  * The URL and any credentials go in a curl config file rather than argv, so
+#    tokens and topics never appear in ps output. Config values are unquoted,
+#    which curl reads as "rest of the line, trimmed" with no escape or @
+#    processing. A newline would break that framing, hence oneline on each.
+req_begin() {
+  mkdir -p "$STATE" 2>/dev/null
+  ( umask 077; : >"$REQ_CFG" ) 2>/dev/null || return 1
+  {
+    req_add 'url' "$1"
+    # fail: without it a 403 from a revoked token exits 0 and `test` lies.
+    printf 'silent\nshow-error\nfail\noutput = /dev/null\n'
+    # A late notification is worthless, so: hard ceiling, no retry. Both
+    # timeouts are needed, since connect-timeout alone does not bound a server
+    # that accepts the connection and then stalls.
+    printf 'connect-timeout = 3\n'
+    req_add 'max-time' "$NTFY_AGENT_TIMEOUT"
+  } >>"$REQ_CFG" 2>/dev/null
+}
+
+req_add() { printf '%s = %s\n' "$1" "$(one "$2")"; }
+
+req_send() {
+  local rc
+  curl --config "$REQ_CFG" "$@" 2>/dev/null
+  rc=$?
+  rm -f "$REQ_CFG" 2>/dev/null
+  return $rc
+}
+
+# http_post <url> [header]... ; body on stdin.
+http_post() {
+  local url f
+  url=$1; shift
+  req_begin "$url" || return 1
+  for f in "$@"; do req_add 'header' "$f"; done >>"$REQ_CFG" 2>/dev/null
+  req_send --data-binary @-
+}
+
+# http_form <url> <header-or-empty> <secret-field>... -- <field>...
+# Secret fields go in the config file; the rest stay in argv, since they are
+# agent text rather than credentials. --form-string never interprets a leading
+# @, unlike -F.
+http_form() {
+  local url hdr f
+  url=$1; hdr=$2; shift 2
+  req_begin "$url" || return 1
+  {
+    [ -n "$hdr" ] && req_add 'header' "$hdr"
+    while [ $# -gt 0 ] && [ "$1" != -- ]; do req_add 'form-string' "$1"; shift; done
+  } >>"$REQ_CFG" 2>/dev/null
+  # The brace group above is not a subshell, so its shifts already landed us on
+  # the -- separator.
+  [ "${1:-}" = -- ] && shift
+  # Rotate $@ in place, interleaving --form-string before each remaining value.
+  for f in "$@"; do set -- "$@" --form-string "$f"; shift; done
+  req_send "$@"
+}
+
+# Every send_* reads $TITLE $BODY $PRIO $TAGS $CLICK.
+
+send_ntfy() {              # ntfy://[token@]{host/}topic
+  local rest scheme host topic token proto
+  scheme=${1%%://*}; rest=${1#*://}
+  case "$scheme" in *+http) proto=http ;; *) proto=https ;; esac
+  case "$rest" in *@*) token=${rest%%@*}; rest=${rest#*@} ;; *) token="" ;; esac
+  case "$rest" in
+    */*) host=${rest%%/*}; topic=${rest#*/} ;;
+    *)   host=ntfy.sh;     topic=$rest ;;
+  esac
+  # https:// is load-bearing. A bare host makes curl try http, which 307s, and
+  # without -L curl stops there and nothing is ever published.
+  set -- "$proto://$host/$topic" "Title: $TITLE" "Tags: $TAGS" "Priority: $PRIO"
+  [ -n "$CLICK" ] && set -- "$@" "Click: $CLICK"
+  [ -n "$token" ] && set -- "$@" "Authorization: Bearer $token"
+  printf '%s' "$BODY" | http_post "$@"
+}
+
+send_pushover() {          # pover://<user>@<token>
+  local rest user token prio
+  rest=${1#*://}; user=${rest%%@*}; token=${rest#*@}
+  if [ "$PRIO" = high ]; then prio=1; else prio=0; fi
+  http_form https://api.pushover.net/1/messages.json "" \
+    "token=$token" "user=$user" -- \
+    "title=$TITLE" "message=$BODY" "priority=$prio" \
+    ${CLICK:+"url=$CLICK"} </dev/null
+}
+
+send_telegram() {          # tgram://<bot-token>/<chat-id>
+  local rest token chat
+  rest=${1#*://}; token=${rest%%/*}; chat=${rest#*/}
+  http_form "https://api.telegram.org/bot$token/sendMessage" "" -- \
+    "chat_id=$chat" "parse_mode=HTML" \
+    "text=<b>$(html_escape "$TITLE")</b>
+$(html_escape "$BODY")" </dev/null
+}
+
+send_discord() {           # discord://<webhook-id>/<webhook-token>
+  {
+    printf '{"embeds":[{"title":"%s","description":"%s"' \
+      "$(jesc "$TITLE")" "$(jesc "$BODY")"
+    [ -n "$CLICK" ] && printf ',"url":"%s"' "$(jesc "$CLICK")"
+    printf '}]}'
+  } | http_post "https://discord.com/api/webhooks/${1#*://}" \
+        'Content-Type: application/json'
+}
+
+send_slack() {             # slack://<T000/B000/xxx>
+  printf '{"text":"%s"}' "$(jesc "$TITLE
+$BODY")" \
+    | http_post "https://hooks.slack.com/services/${1#*://}" \
+        'Content-Type: application/json'
+}
+
+send_gotify() {            # gotify://<token>@<host> or gotify://<host>/<token>
+  local rest token host prio
+  rest=${1#*://}
+  # Apprise, which the other schemes here came from, writes the host first.
+  # Splitting on @ alone left both halves holding the whole string, which POSTed
+  # the credential as a URL path segment.
+  case "$rest" in
+    *@*) token=${rest%%@*}; host=${rest#*@} ;;
+    */*) host=${rest%/*};   token=${rest##*/} ;;
+    *)   return 1 ;;
+  esac
+  [ -n "$host" ] && [ -n "$token" ] || return 1
+  if [ "$PRIO" = high ]; then prio=8; else prio=4; fi
+  http_form "https://$host/message" "X-Gotify-Key: $token" -- \
+    "title=$TITLE" "message=$BODY" "priority=$prio" </dev/null
+}
+
+send_webhook() {           # https://...: the normalized event as JSON
+  # Every field is escaped. session_id in particular is agent text and would
+  # otherwise inject top-level keys into whatever consumes this.
+  printf '{"agent":"%s","event":"%s","project":"%s","session":"%s","cwd":"%s","elapsed":%s,"title":"%s","body":"%s","click":"%s"}' \
+    "$(jesc "$AGENT")" "$(jesc "$EVENT")" "$(jesc "$PROJECT")" \
+    "$(jesc "$SESSION")" "$(jesc "$CWD")" "${ELAPSED:-null}" \
+    "$(jesc "$TITLE")" "$(jesc "$BODY")" "$(jesc "$CLICK")" \
+    | http_post "$1" 'Content-Type: application/json'
+}
+
+send_cmd() {               # cmd://<shell command>: escape hatch, e.g. apprise
+  NTFY_TITLE="$TITLE" NTFY_BODY="$BODY" NTFY_PRIORITY="$PRIO" \
+  NTFY_CLICK="$CLICK" NTFY_AGENT_NAME="$AGENT" NTFY_EVENT="$EVENT" \
+    sh -c "${1#*://}" </dev/null >/dev/null 2>&1
+}
+
+send_desktop() {
+  local icon
+  if [ "$EVENT" = needs_input ]; then icon='🔔'; else icon='✅'; fi
+  case "$(platform)" in
+    macos)
+      # AppleScript string literals have no escape for arbitrary text, so drop
+      # the only two characters that can break out of one.
+      osascript \
+        -e "display notification \"$(printf '%s' "$BODY" | tr -d '\\"')\" with title \"$icon $(printf '%s' "$TITLE" | tr -d '\\"')\" sound name \"Ping\"" \
+        >/dev/null 2>&1
+      ;;
+    windows) win_toast "$icon" ;;
+    linux)
+      # critical does not auto-expire in dunst/GNOME, which is what you want for
+      # a permission prompt.
+      notify-send -a ntfy-agent \
+        -u "$([ "$EVENT" = needs_input ] && echo critical || echo normal)" \
+        "$icon $TITLE" "$BODY" >/dev/null 2>&1
+      ;;
+  esac
+}
+
+win_toast() {
+  local ps script
+  ps=$(command -v powershell.exe 2>/dev/null || command -v powershell 2>/dev/null) \
+    || return 0
+  # Single quotes doubled is PowerShell's own escape for a literal quote.
+  script=$(printf "New-BurntToastNotification -Text '%s','%s'" \
+    "$(printf '%s' "$1 $TITLE" | sed "s/'/''/g")" \
+    "$(printf '%s' "$BODY" | sed "s/'/''/g")")
+  if have iconv && have base64; then
+    # -EncodedCommand sidesteps quoting across the sh -> interop -> PowerShell
+    # boundary entirely, which is where naive WSL notifiers break.
+    "$ps" -NoProfile -NonInteractive -EncodedCommand \
+      "$(printf '%s' "$script" | iconv -f UTF-8 -t UTF-16LE | base64 | tr -d '\n\r')" \
+      >/dev/null 2>&1
+  else
+    "$ps" -NoProfile -NonInteractive -Command "$script" >/dev/null 2>&1
+  fi
+}
+
+# Returns the number of destinations that failed, so `test` can report the
+# truth. The hook path ignores it: a failed notification is not worth telling
+# the agent about.
+# Every scheme send_url routes. doctor validates against this one list, so a
+# destination it calls valid is exactly one dispatch knows how to deliver.
+SCHEMES='ntfy ntfy+http pover tgram discord slack gotify http https cmd'
+
+known_scheme() {
+  case " $SCHEMES " in *" ${1%%://*} "*) return 0 ;; esac
+  return 1
+}
+
+# One destination per line. Never splits on spaces: a cmd:// destination is a
+# shell command and will contain them. It cannot hold a bare comma.
+each_url() { printf '%s' "${1:-}" | tr ',' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; /^$/d'; }
+
+send_url() {
+  case "${1%%://*}" in
+    ntfy|ntfy+http)  send_ntfy "$1" ;;
+    pover)           send_pushover "$1" ;;
+    tgram)           send_telegram "$1" ;;
+    discord)         send_discord "$1" ;;
+    slack)           send_slack "$1" ;;
+    gotify)          send_gotify "$1" ;;
+    http|https)      send_webhook "$1" ;;
+    cmd)             send_cmd "$1" ;;
+  esac
+}
+
+dispatch() {
+  local url oldifs failed
+  failed=0
+  # Split on lines only, so a cmd:// destination keeps its spaces.
+  oldifs=$IFS; IFS=$NL
+  # One failing destination must never suppress the others, hence no && chain.
+  for url in $(each_url "$NTFY_AGENT_URLS"); do
+    IFS=$oldifs
+    if ! known_scheme "$url"; then
+      printf 'ntfy-agent: unknown scheme %s\n' "${url%%://*}" >&2
+      failed=$((failed + 1))
+    elif ! send_url "$url"; then
+      printf 'ntfy-agent: %s failed\n' "${url%%://*}" >&2
+      failed=$((failed + 1))
+    fi
+    IFS=$NL
+  done
+  IFS=$oldifs
+  desktop_ok && send_desktop
+  return "$failed"
+}
+
+# ------------------------------------------------------------ normalizing ----
+
+AGENT="" EVENT="" MESSAGE="" SESSION="" CWD="" PROJECT="" ELAPSED=""
+TITLE="" BODY="" PRIO=default TAGS=""; CLICK=""
+
+
+# A path under the state directory, keyed by something agent-controlled, so the
+# key is reduced to characters that are safe in a filename.
+state_path() {
+  mkdir -p "$STATE/$1" 2>/dev/null
+  printf '%s/%s/%s' "$STATE" "$1" "$(printf '%s' "$2" | tr -c 'A-Za-z0-9._-' '_')"
+}
+
+# Turn duration comes from a stamp written by the agent's prompt-submit hook.
+# Deliberately not read from a transcript: `date +%s` arithmetic is portable,
+# whereas parsing an ISO timestamp needs GNU date or BSD date, never both.
+stamp_file() { state_path started "${SESSION:-$CWD}"; }
+
+record_start() {
+  date +%s >"$(stamp_file)" 2>/dev/null
+  return 0
+}
+
+read_elapsed() {
+  local f started now
+  f=$(stamp_file)
+  started=$(cat "$f" 2>/dev/null) || return 0
+  rm -f "$f" 2>/dev/null
+  case "$started" in ''|*[!0-9]*) return 0 ;; esac
+  now=$(date +%s)
+  ELAPSED=$((now - started))
+}
+
+human_elapsed() {
+  [ -n "$ELAPSED" ] || return 0
+  if [ "$ELAPSED" -lt 60 ]; then printf '%ss' "$ELAPSED"
+  elif [ "$ELAPSED" -lt 3600 ]; then printf '%sm' "$((ELAPSED / 60))"
+  else printf '%sh%sm' "$((ELAPSED / 3600))" "$(((ELAPSED % 3600) / 60))"
+  fi
+}
+
+resolve_context() {
+  local branch
+  SESSION=$(jget session_id)
+  [ -n "$SESSION" ] || SESSION=$(jget conversation_id)   # Cursor's rename
+  [ -n "$SESSION" ] || SESSION=$(jget sessionId)         # Copilot's camelCase
+  [ -n "$SESSION" ] || SESSION=$(jget thread-id)         # Codex legacy notify
+  CWD=$(jget cwd)
+  [ -n "$CWD" ] || CWD="${CLAUDE_PROJECT_DIR:-${CURSOR_PROJECT_DIR:-$PWD}}"
+  PROJECT=$(basename "$CWD" 2>/dev/null)
+  # git says HEAD when detached or before the first commit, which reads as
+  # "proj@HEAD" and tells the reader nothing.
+  branch=$(git -C "$CWD" rev-parse --abbrev-ref HEAD 2>/dev/null)
+  [ -n "$branch" ] && [ "$branch" != HEAD ] && PROJECT="$PROJECT@$branch"
+  return 0
+}
+
+# Map an agent's raw event onto the normalized done / needs_input pair.
+# Returns non-zero for events we deliberately drop.
+normalize() {
+  local role ntype stash
+  AGENT=$1; role=$2
+  case "$AGENT:$role" in
+    *:start) EVENT=start ;;
+
+    # Prefer the payload's own copy of the last message over any transcript.
+    claude:stop|codex:stop|copilot:stop)
+      EVENT="done"; MESSAGE=$(jget last_assistant_message) ;;
+    gemini:stop)
+      EVENT="done"; MESSAGE=$(jget prompt_response) ;;
+
+    codex:notify)
+      # Codex's legacy `notify`: payload arrives as argv, keys are hyphenated,
+      # and agent-turn-complete is the only event it emits.
+      [ "$(jget type)" = "agent-turn-complete" ] || return 1
+      EVENT="done"; MESSAGE=$(jget last-assistant-message) ;;
+
+    cursor:response)
+      # Cursor's `stop` carries no text, so stash afterAgentResponse and let the
+      # following `stop` send it.
+      resolve_context
+      # Flattened first: awk's RS="\0" is paragraph mode on BSD awk and mawk, so
+      # multi-paragraph text would otherwise be truncated once per paragraph.
+      # 2000 is a sanity bound; NTFY_AGENT_MAX_BODY applies later, in compose.
+      jget text | oneline | truncate_chars 2000 >"$(state_path cursor "$SESSION")" 2>/dev/null
+      return 1 ;;
+    cursor:stop)
+      EVENT="done"
+      resolve_context
+      # Consume the stash whatever the outcome, or an aborted turn's text goes
+      # out with the next completed one.
+      stash=$(state_path cursor "$SESSION")
+      MESSAGE=$(cat "$stash" 2>/dev/null)
+      rm -f "$stash" 2>/dev/null
+      [ "$(jget status)" = aborted ] && return 1 ;;
+
+    *:notification)
+      # Branch on the structured type, never on the message text.
+      ntype=$(jget notification_type)
+      case "$ntype" in
+        permission_prompt|idle_prompt|agent_needs_input|elicitation_dialog| \
+        ToolPermission|agent_idle)
+          EVENT=needs_input; MESSAGE=$(jget message) ;;
+        agent_completed)
+          # Copilot's agentStop carries no assistant text at all, so this is the
+          # only place a finished Copilot turn gets a body.
+          EVENT="done"; MESSAGE=$(jget message) ;;
+        *) return 1 ;;
+      esac ;;
+    *:permission)
+      EVENT=needs_input; MESSAGE=$(jget message)
+      : "${MESSAGE:=Permission requested}" ;;
+
+    *:done) EVENT="done"; MESSAGE=$(jget last_assistant_message) ;;
+    *:needs_input) EVENT=needs_input; MESSAGE=$(jget message) ;;
+    *) return 1 ;;
+  esac
+  return 0
+}
+
+compose() {
+  local who suffix
+  who=$(agent_label "$AGENT")
+  case "$EVENT" in
+    needs_input)
+      TITLE="$who needs input · $PROJECT"
+      : "${MESSAGE:=Waiting for you}"
+      TAGS=bell; PRIO=high ;;
+    *)
+      suffix=$(human_elapsed)
+      TITLE="$who finished · $PROJECT${suffix:+ ($suffix)}"
+      : "${MESSAGE:=Turn complete}"
+      TAGS=white_check_mark; PRIO=default ;;
+  esac
+  TITLE=$(one "$TITLE")
+  if [ "$NTFY_AGENT_BODY" = none ]; then
+    BODY="$TITLE"
+  else
+    BODY=$(one "$MESSAGE" | truncate_chars "$NTFY_AGENT_MAX_BODY")
+    [ -n "$BODY" ] || BODY="$TITLE"
+  fi
+  if [ -n "$NTFY_AGENT_CLICK" ]; then
+    # Substituted with awk using literal (non-regex) replacement: a `|` in a
+    # path broke the old sed expression outright, and `&` silently expanded to
+    # the whole match. oneline then strips any CR, which curl would otherwise
+    # pass through verbatim as a header split.
+    CLICK=$(_tpl="$NTFY_AGENT_CLICK" _cwd="$CWD" _ses="$SESSION" _agt="$AGENT" \
+      awk '
+      BEGIN {
+        tpl = ENVIRON["_tpl"]
+        n = split("{cwd}\n{session}\n{agent}", keys, "\n")
+        vals[1] = ENVIRON["_cwd"]; vals[2] = ENVIRON["_ses"]
+        vals[3] = ENVIRON["_agt"]
+        for (i = 1; i <= n; i++) {
+          while ((p = index(tpl, keys[i])) > 0) {
+            tpl = substr(tpl, 1, p - 1) vals[i] substr(tpl, p + length(keys[i]))
+          }
+        }
+        printf "%s", tpl
+      }' | oneline)
+  fi
+}
+
+# ------------------------------------------------------------ subcommands ----
+
+cmd_hook() {
+  local agent role
+  agent=${1:-generic}; role=${2:-done}
+  if [ $# -ge 2 ]; then shift 2; else shift $#; fi
+  # Codex's legacy `notify` appends the JSON as the final argv element and gives
+  # the process no stdin, so only read stdin when no payload was passed.
+  if [ -n "${1:-}" ]; then
+    PAYLOAD=$1
+  elif [ ! -t 0 ]; then
+    # Read through fd 3, never fd 0.
+    #
+    # A closed fd 0 is not a tty either, so it reaches here. Running `cat` then
+    # deadlocks forever under bash and macOS sh: the command substitution
+    # allocates its pipe at the lowest free descriptor, which is 0, so cat waits
+    # on its own output. Duplicating fd 0 to fd 3 happens before that pipe
+    # exists, and the dup simply fails when fd 0 is closed, so there is nothing
+    # to detect and nothing to hang on.
+    if exec 3<&0 2>/dev/null; then
+      PAYLOAD=$(cat <&3 2>/dev/null)
+      exec 3<&-
+    fi
+  fi
+  normalize "$agent" "$role" || return 0
+  [ -n "$SESSION" ] || resolve_context
+
+  if [ "$EVENT" = start ]; then record_start; return 0; fi
+  [ "$EVENT" = "done" ] && read_elapsed
+
+  event_enabled "$EVENT" || return 0
+  [ -n "$NTFY_AGENT_URLS" ] || desktop_ok || return 0
+  snoozed && return 0
+  # Quiet hours mute finished turns only. A blocked agent is always worth waking
+  # for, otherwise it sits idle until morning.
+  within_quiet_hours && [ "$EVENT" = "done" ] && return 0
+  # Before debounce, never after: a turn dropped for being short must not
+  # consume the window, or the next long turn lands inside it and is swallowed.
+  if [ "$EVENT" = "done" ] && [ -n "$ELAPSED" ] \
+     && [ "$ELAPSED" -lt "$NTFY_AGENT_MIN_SECONDS" ]; then
+    return 0
+  fi
+  # Same key as stamp_file: a payload with no session id would otherwise put
+  # every project in one bucket, letting two of them mute each other.
+  debounced "${SESSION:-$CWD}" "$EVENT" && return 0
+
+  compose
+
+  # Hand the send to a brand new process rather than forking one.
+  #
+  # Redirecting a forked subshell is not enough: both bash and dash keep a saved
+  # copy of the original stdout so a `{ ...; } >/dev/null` group can restore it,
+  # and a forked child inherits that copy. An agent that captures hook output
+  # then blocks until the slowest transport finishes, because its pipe still has
+  # a writer, even though the hook process exited immediately. Only exec clears
+  # those descriptors. Verified against sh, bash, dash and zsh.
+  #
+  # Invoked as `sh "$SELF"` rather than "$SELF" so it still works when the file
+  # is not marked executable, which happens when someone downloads it by hand.
+  #
+  # The composed notification travels in the environment, never in argv, so no
+  # token or topic is ever visible in ps.
+  (
+    NTFY_SEND_TITLE="$TITLE" NTFY_SEND_BODY="$BODY" NTFY_SEND_PRIO="$PRIO" \
+    NTFY_SEND_TAGS="$TAGS" NTFY_SEND_CLICK="$CLICK" NTFY_SEND_AGENT="$AGENT" \
+    NTFY_SEND_EVENT="$EVENT" NTFY_SEND_PROJECT="$PROJECT" \
+    NTFY_SEND_SESSION="$SESSION" NTFY_SEND_CWD="$CWD" \
+    NTFY_SEND_ELAPSED="$ELAPSED" \
+      exec sh "$SELF" __send </dev/null >/dev/null 2>&1 &
+  )
+  return 0
+}
+
+# Internal: the detached half of a hook notification. Not a user-facing command.
+cmd__send() {
+  TITLE=${NTFY_SEND_TITLE:-}; BODY=${NTFY_SEND_BODY:-}
+  PRIO=${NTFY_SEND_PRIO:-default}; TAGS=${NTFY_SEND_TAGS:-}
+  CLICK=${NTFY_SEND_CLICK:-}; AGENT=${NTFY_SEND_AGENT:-}
+  EVENT=${NTFY_SEND_EVENT:-}; PROJECT=${NTFY_SEND_PROJECT:-}
+  SESSION=${NTFY_SEND_SESSION:-}; CWD=${NTFY_SEND_CWD:-}
+  ELAPSED=${NTFY_SEND_ELAPSED:-}
+  [ -n "$TITLE" ] || return 0
+  dispatch
+}
+
+cmd_send() {
+  [ $# -ge 1 ] || die "usage: ntfy-agent send <title> [body]"
+  AGENT=manual; EVENT="done"; CWD=$PWD; PROJECT=$(basename "$PWD")
+  TITLE=$(one "$1")
+  BODY=$(one "${2:-$1}" | truncate_chars "$NTFY_AGENT_MAX_BODY")
+  TAGS=white_check_mark; PRIO=default
+  dispatch
+}
+
+cmd_test() {
+  local failed
+  [ -n "$NTFY_AGENT_URLS" ] || die "no destinations configured. Run: ntfy-agent setup"
+  say "Sending a test notification to: $(redact "$NTFY_AGENT_URLS")"
+  AGENT=ntfy-agent; EVENT=needs_input; SESSION="test"; CWD=$PWD
+  PROJECT=$(basename "$PWD")
+  MESSAGE="If this reached your phone, you are done."
+  compose
+  # Assigned, not prefixed: `VAR=x func` leaks globally in dash and is
+  # unspecified in POSIX.
+  NTFY_AGENT_DESKTOP=always
+  dispatch
+  failed=$?
+  if [ "$failed" = 0 ]; then
+    say "Sent. Nothing on your phone? Run: ntfy-agent doctor"
+  else
+    say "$failed destination(s) failed. Run: ntfy-agent doctor"
+    return 1
+  fi
+}
+
+random_topic() {
+  if have openssl; then
+    openssl rand -hex 16
+  elif [ -r /dev/urandom ]; then
+    LC_ALL=C tr -dc 'a-zA-Z0-9' </dev/urandom 2>/dev/null | dd bs=1 count=32 2>/dev/null
+  else
+    die "no source of randomness. Install openssl, or write NTFY_AGENT_URLS into $CONF by hand."
+  fi
+}
+
+cmd_setup() {
+  local topic urls min quiet
+  mkdir -p "$CONF_DIR" "$STATE" || die "cannot create $CONF_DIR"
+  if [ -f "$CONF" ]; then
+    say "Config already exists: $CONF"
+    say "Edit it directly, or delete it and re-run setup."
+    return 0
+  fi
+  topic="ntfy-agent-$(random_topic)"
+
+  # stdout, not stdin: `curl | sh` leaves stdin holding the script, which is
+  # also why a prompt reads /dev/tty. The open is tried in a subshell because a
+  # failing redirection on a special builtin exits the shell outright.
+  if [ "${NTFY_AGENT_YES:-0}" != 1 ] && [ -t 1 ] && ( : </dev/tty ) 2>/dev/null
+  then INTERACTIVE=1; say "Press Enter to take the default for each."
+  fi
+  urls=$(ask "Send notifications to" "ntfy://$topic")
+  min=$(ask "Ignore finished turns shorter than (seconds)" 60)
+  while ! is_num "$min"; do
+    min=$(ask "Seconds, digits only" 60)
+  done
+  quiet=$(ask "Mute overnight, as HH:MM-HH:MM (blank for never)" "")
+  while [ -n "$quiet" ] && ! valid_window "$quiet"; do
+    quiet=$(ask "Needs the form 23:00-07:00, or blank" "")
+  done
+  interactive && say ""
+  # umask before create, not chmod after: chmod leaves a window in which the
+  # topic, which IS the credential on ntfy.sh, is world-readable.
+  ( umask 077; cat >"$CONF" ) <<EOF
+# ntfy-agent config. Environment variables override every value here.
+
+# Where to send, comma separated. The scheme picks the transport; the full list
+# is at https://github.com/Prog-Jacob/ntfy-agent#where-notifications-go
+NTFY_AGENT_URLS="$urls"
+
+# Desktop banner, in addition to the push. auto skips SSH, CI and headless.
+# auto | always | never
+NTFY_AGENT_DESKTOP=auto
+
+# Which events to send: done, needs_input
+NTFY_AGENT_EVENTS="done,needs_input"
+
+# Skip finished turns shorter than this. Permission prompts always get through.
+NTFY_AGENT_MIN_SECONDS=$min
+
+# One notification per window per session, so a burst becomes one buzz.
+NTFY_AGENT_DEBOUNCE_SECONDS=30
+
+# summary sends the agent's last message. none sends the title only, which keeps
+# code and paths off a third-party server.
+NTFY_AGENT_BODY=summary
+NTFY_AGENT_MAX_BODY=300
+
+# Mute finished-turn pings overnight, local time. Empty disables.
+NTFY_AGENT_QUIET_HOURS="$quiet"
+
+# Tap the notification to land back in the session. {cwd} {session} {agent}
+# NTFY_AGENT_CLICK="vscode://file{cwd}"
+NTFY_AGENT_CLICK=""
+EOF
+  say "Wrote $CONF"
+  say ""
+  load_config   # so a test sent below uses what was just answered
+  # True of the generated topic only. A typed-in destination has its own setup.
+  if [ "$urls" = "ntfy://$topic" ]; then
+    say "Subscribe your phone:"
+    say "  1. Install ntfy (App Store, Play Store or F-Droid)"
+    say "  2. Subscribe to topic:  $topic"
+    say ""
+    say "Or open https://ntfy.sh/$topic in any browser."
+    say ""
+    say "That topic is the password. Anyone who learns it can read your"
+    say "notifications, so do not share or commit it."
+    say ""
+  fi
+  # Offered, never assumed: install edits another tool's config and there is
+  # nobody to decline. Gated on detection too, since cmd_install dies on none.
+  if [ -n "$(detect_agents)" ] && interactive &&
+     confirm "Wire ntfy-agent into your coding agents now?" Y; then
+    cmd_install || return 1
+    if confirm "Send a test notification?" Y; then cmd_test; fi
+  else
+    say "Next:  ntfy-agent install && ntfy-agent test"
+  fi
+}
+
+# Mask every scheme, not a known list: a cmd:// or https:// destination can
+# carry a token just as easily as a topic can. Stops at a comma so each
+# destination in a list is masked separately.
+redact() { printf '%s' "$1" | sed 's,://[^,]*,://<redacted>,g'; }
+
+
+# ------------------------------------------------------------- wiring in ----
+
+HOOK_MARKER='ntfy-agent:hook'
+
+# The trailing comment is the uninstall marker. It is inert to the shell and
+# makes removal exact rather than a substring guess.
+hookcmd() { printf '"%s" hook %s %s # %s' "$SELF" "$1" "$2" "$HOOK_MARKER"; }
+
+backup() {
+  [ -f "$1" ] || return 0
+  mkdir -p "$STATE/backups" 2>/dev/null
+  cp "$1" "$STATE/backups/$(printf '%s' "${1#"$HOME"/}" | tr '/' '_').$(date +%Y%m%d%H%M%S)"
+}
+
+# Merge our hooks into a JSON settings file without disturbing anything else.
+# jq is required here, at install time only. The hook path never needs it.
+# wire_json <file> <jq-filter> [agent]
+# Given an agent, the filter can reference $stop, $notify, $start and $response.
+# They are passed as jq args rather than pasted into the filter, because each
+# hook command contains a quoted path that would break a jq string literal.
+wire_json() {
+  local file filter agent tmp
+  file=$1; filter=$2; agent=${3:-}
+  have jq || die "jq is required to edit $file (brew install jq / apt install jq)"
+  [ -f "$file" ] || { mkdir -p "$(dirname "$file")"; echo '{}' >"$file"; }
+  backup "$file"
+  tmp="$file.ntfy-agent.$$"
+  if [ -n "$agent" ]; then
+    jq --arg stop "$(hookcmd "$agent" stop)" \
+       --arg notify "$(hookcmd "$agent" notification)" \
+       --arg start "$(hookcmd "$agent" start)" \
+       --arg response "$(hookcmd "$agent" response)" \
+       "$filter" "$file" >"$tmp" 2>/dev/null
+  else
+    jq "$filter" "$file" >"$tmp" 2>/dev/null
+  fi
+  commit_tmp "$file" "$tmp" "check it is valid JSON with: jq . \"$file\""
+}
+
+# Replace <file> with <tmp>, or report and keep the original untouched.
+commit_tmp() {
+  local file tmp fixhint
+  file=$1; tmp=$2; fixhint=${3:-}
+  if [ -s "$tmp" ] && mv "$tmp" "$file"; then
+    say "  ${WIRE_VERB:-wired} $file"
+    return 0
+  fi
+  rm -f "$tmp"
+  say "  FAILED to edit $file, left unchanged"
+  [ -n "$fixhint" ] && say "        fix: $fixhint"
+  WIRE_FAILED=1
+  return 1
+}
+
+# Drop any hook entry pointing at us, so install is idempotent and uninstall is
+# exact. Matching is on the marker we write, not on the substring "ntfy-agent",
+# so a user's own `my-ntfy-agent-lint` hook survives. Hook groups left empty by
+# the removal are pruned afterwards.
+JQ_PRUNE='def scrub:
+  walk(if type == "object"
+          and (((.command? | type) == "string" and (.command | test("ntfy-agent:hook")))
+               or ((.bash? | type) == "string" and (.bash | test("ntfy-agent:hook"))))
+       then empty else . end)
+  | walk(if type == "object" and (.hooks? | type) == "array"
+         then .hooks |= map(select(. != null))
+         else . end)
+  | walk(if type == "object" and (.hooks? | type) == "array" and (.hooks | length) == 0
+         then empty else . end)
+  | (if (.hooks? | type) == "object" then
+       .hooks |= (with_entries(
+         if (.value | type) == "array"
+         then .value |= map(select(. != null))
+         else . end)
+         | with_entries(select((.value | type != "array")
+                               or (.value | length > 0))))
+     else . end);
+scrub | '
+
+install_claude() {
+  # shellcheck disable=SC2016  # $stop/$notify/$start are jq args, not shell vars
+  wire_json "$HOME/.claude/settings.json" "$JQ_PRUNE"'
+      .hooks.Stop = ((.hooks.Stop // []) + [{hooks:[{type:"command",timeout:10,command:$stop}]}])
+    | .hooks.Notification = ((.hooks.Notification // []) + [{hooks:[{type:"command",timeout:10,command:$notify}]}])
+    | .hooks.UserPromptSubmit = ((.hooks.UserPromptSubmit // []) + [{hooks:[{type:"command",timeout:10,command:$start}]}])' claude
+}
+
+install_gemini() {
+  # Gemini's `timeout` is milliseconds. Every other agent uses seconds.
+  # shellcheck disable=SC2016  # $stop/$notify/$start are jq args, not shell vars
+  wire_json "$HOME/.gemini/settings.json" "$JQ_PRUNE"'
+      .hooks.AfterAgent = ((.hooks.AfterAgent // []) + [{hooks:[{type:"command",timeout:10000,command:$stop}]}])
+    | .hooks.Notification = ((.hooks.Notification // []) + [{hooks:[{type:"command",timeout:10000,command:$notify}]}])
+    | .hooks.BeforeAgent = ((.hooks.BeforeAgent // []) + [{hooks:[{type:"command",timeout:10000,command:$start}]}])' gemini
+}
+
+install_cursor() {
+  # shellcheck disable=SC2016  # $stop/$notify/$start are jq args, not shell vars
+  wire_json "$HOME/.cursor/hooks.json" "$JQ_PRUNE"'
+      .version = 1
+    | .hooks.stop = ((.hooks.stop // []) + [{command:$stop}])
+    | .hooks.afterAgentResponse = ((.hooks.afterAgentResponse // []) + [{command:$response}])
+    | .hooks.beforeSubmitPrompt = ((.hooks.beforeSubmitPrompt // []) + [{command:$start}])' cursor
+}
+
+install_copilot() {
+  # shellcheck disable=SC2016  # $stop/$notify/$start are jq args, not shell vars
+  wire_json "$HOME/.copilot/settings.json" "$JQ_PRUNE"'
+      .version = 1
+    | .hooks.agentStop = ((.hooks.agentStop // []) + [{type:"command",timeoutSec:10,bash:$stop}])
+    | .hooks.notification = ((.hooks.notification // []) + [{type:"command",timeoutSec:10,bash:$notify}])
+    | .hooks.userPromptSubmitted = ((.hooks.userPromptSubmitted // []) + [{type:"command",timeoutSec:10,bash:$start}])' copilot
+}
+
+install_codex() {
+  local s
+  s="$HOME/.codex/config.toml"
+  mkdir -p "$HOME/.codex"
+  [ -f "$s" ] || : >"$s"
+  if grep -q "$HOOK_MARKER" "$s" 2>/dev/null; then
+    say "  already wired $s"; return 0
+  fi
+  if grep -q '^[[:space:]]*notify[[:space:]]*=' "$s" 2>/dev/null; then
+    say "  SKIPPED $s: a 'notify' key already exists. Replace it with:"
+    say "    notify = [\"$SELF\", \"hook\", \"codex\", \"notify\"]"
+    return 0
+  fi
+  backup "$s"
+  # `notify` is a top-level key, so it must appear before any [table]. Prepending
+  # is the only edit that is safe without a TOML parser.
+  { printf 'notify = ["%s", "hook", "codex", "notify"]  # %s\n\n' "$SELF" "$HOOK_MARKER"
+    cat "$s"; } >"$s.ntfy-agent.$$" 2>/dev/null
+  commit_tmp "$s" "$s.ntfy-agent.$$"
+}
+
+# The agent registry: id, display name, config file under $HOME, config format.
+# Every other place that needs to know about an agent derives from this table,
+# so adding one means adding a row here and an install_<id> function.
+agents() {
+  printf '%s\n' \
+    'claude:Claude Code:.claude/settings.json:json' \
+    'codex:Codex:.codex/config.toml:toml' \
+    'cursor:Cursor:.cursor/hooks.json:json' \
+    'gemini:Gemini:.gemini/settings.json:json' \
+    'copilot:Copilot:.copilot/settings.json:json'
+}
+
+# agent_field <id> <1=label|2=config|3=format>, empty if the agent is unknown.
+agent_field() {
+  agents | awk -F: -v id="$1" -v n="$2" '$1 == id { print $(n + 1); exit }'
+}
+
+agent_ids() { agents | cut -d: -f1; }
+
+# The id list as prose, for help text and error messages.
+agent_list() { agent_ids | awk '{ printf "%s%s", sep, $0; sep = ", " }'; }
+
+agent_label() {
+  local label
+  label=$(agent_field "$1" 1)
+  printf '%s' "${label:-$1}"
+}
+
+agent_config_file() {
+  local rel
+  rel=$(agent_field "$1" 2)
+  [ -n "$rel" ] && printf '%s/%s' "$HOME" "$rel"
+}
+
+# An agent counts as installed if its config directory exists.
+detect_agents() {
+  local id f
+  for id in $(agent_ids); do
+    f=$(agent_config_file "$id")
+    [ -d "$(dirname "$f")" ] && echo "$id"
+  done
+  return 0
+}
+
+cmd_install() {
+  local agents a
+  WIRE_FAILED=0
+  agents="$*"
+  [ -n "$agents" ] || agents=$(detect_agents)
+  [ -n "$agents" ] || die "no agents detected. Name them explicitly, e.g.: ntfy-agent install claude codex"
+  # shellcheck disable=SC2086  # deliberate word splitting over the agent list
+  say "Wiring ntfy-agent into:$(printf ' %s' $agents)"
+  for a in $agents; do
+    if [ -n "$(agent_field "$a" 1)" ]; then
+      "install_$a"
+    else
+      say "  unknown agent: $a. Known: $(agent_list)"
+    fi
+  done
+  say ""
+  if [ "$WIRE_FAILED" = 1 ]; then
+    say "Some agents were not wired. Fix the errors above and run install again."
+    return 1
+  fi
+  say "Backups in $STATE/backups"
+  say "Restart any running agent session, then: ntfy-agent test"
+}
+
+cmd_uninstall() {
+  local a f
+  say "Removing ntfy-agent hooks."
+  WIRE_VERB=cleaned
+  for a in $(agent_ids); do
+    [ "$(agent_field "$a" 3)" = json ] || continue
+    f=$(agent_config_file "$a")
+    grep -qs "$HOOK_MARKER" "$f" 2>/dev/null || continue
+    wire_json "$f" "$JQ_PRUNE"'
+      if (.hooks? | type == "object") and (.hooks | length == 0)
+      then del(.hooks) else . end'
+  done
+  f=$(agent_config_file codex)
+  if [ -f "$f" ] && grep -q "$HOOK_MARKER" "$f" 2>/dev/null; then
+    backup "$f"
+    # Anchored on the marker comment we wrote, so a user's own line that merely
+    # mentions ntfy-agent survives. Drops our notify line and the blank line
+    # install added after it, leaving a blank line the user already had.
+    awk -v m="$HOOK_MARKER" '
+      skip == 1 && $0 == "" { skip = 0; next }
+      $0 ~ /^notify = / && index($0, m) > 0 { skip = 1; next }
+      { skip = 0; print }' "$f" >"$f.ntfy-agent.$$" 2>/dev/null
+    commit_tmp "$f" "$f.ntfy-agent.$$"
+  fi
+  WIRE_VERB=
+  say ""
+  say "Config and state kept. To remove those too:"
+  say "  rm -rf \"$CONF_DIR\" \"$STATE\""
+}
+
+cmd_snooze() {
+  local mins
+  mins=${1:-60}
+  case "$mins" in
+    off) rm -f "$STATE/snooze"; say "Snooze cleared."; return 0 ;;
+  esac
+  is_num "$mins" || die "usage: ntfy-agent snooze [minutes|off]"
+  mins=$(strip0 "$mins")   # `08` is an invalid octal literal, dash aborts on it
+  [ "$mins" = 0 ] && { rm -f "$STATE/snooze"; say "Snooze cleared."; return 0; }
+  mkdir -p "$STATE"
+  printf '%s' "$(( $(date +%s) + mins * 60 ))" >"$STATE/snooze"
+  say "Snoozed for $mins minutes."
+}
+
+cmd_status() {
+  local a f wired detected
+  say "ntfy-agent $VERSION"
+  say "config        $CONF$([ -f "$CONF" ] || printf '  (missing, run: ntfy-agent setup)')"
+  say "destinations  $(redact "${NTFY_AGENT_URLS:-none}")"
+  say "desktop       $NTFY_AGENT_DESKTOP ($(desktop_ok && echo available || echo unavailable here))"
+  say "events        $NTFY_AGENT_EVENTS"
+  say "gates         min ${NTFY_AGENT_MIN_SECONDS}s, debounce ${NTFY_AGENT_DEBOUNCE_SECONDS}s, quiet ${NTFY_AGENT_QUIET_HOURS:-off}"
+  say "click         ${NTFY_AGENT_CLICK:-none}"
+  say "body          $NTFY_AGENT_BODY, max ${NTFY_AGENT_MAX_BODY} chars"
+  snoozed && say "snoozed       yes"
+  say ""
+  say "agents:"
+  detected=$(detect_agents)
+  for a in $detected; do
+    f=$(agent_config_file "$a")
+    if grep -qs "$HOOK_MARKER" "$f" 2>/dev/null; then wired=yes; else wired=no; fi
+    say "  $a  hooks=$wired"
+  done
+  [ -n "$detected" ] || say "  (none detected)"
+}
+
+cmd_doctor() {
+  local fail=0 perms detected oldifs u a
+  # ck <label> <remedy> <cmd...>: runs cmd, reports, remembers failure.
+  ck() {
+    local label remedy
+    label=$1; remedy=$2; shift 2
+    if "$@" >/dev/null 2>&1; then printf '  ok    %s\n' "$label"
+    else printf '  FAIL  %s\n        fix: %s\n' "$label" "$remedy"; fail=1; fi
+  }
+  warn() { printf '  warn  %s\n        %s\n' "$1" "$2"; }
+
+  say "ntfy-agent doctor"
+  ck "curl present" "install curl" have curl
+  have jq || warn "jq not found, so install and uninstall cannot edit agent configs" \
+    "brew install jq  |  apt install jq"
+  if [ -f "$CONF" ]; then
+    printf '  ok    config exists\n'
+  elif [ -n "$NTFY_AGENT_URLS" ]; then
+    printf '  ok    configured by environment, no config file needed\n'
+  else
+    ck "config exists" "run: ntfy-agent setup" false
+  fi
+  ck "at least one destination configured" "run: ntfy-agent setup" \
+     test -n "$NTFY_AGENT_URLS"
+
+  if [ -f "$CONF" ]; then
+    perms=$(stat -f '%Lp' "$CONF" 2>/dev/null || stat -c '%a' "$CONF" 2>/dev/null)
+    case "$perms" in
+      600|400) printf '  ok    config is not readable by others\n' ;;
+      '') warn "cannot read config permissions" "check \"$CONF\" by hand" ;;
+      *) warn "config mode is $perms; the topic in it is a password" \
+              "chmod 600 \"$CONF\"" ;;
+    esac
+  fi
+
+  case "$NTFY_AGENT_URLS" in
+    *ntfy://*|*ntfy+*)
+      if have curl && curl -sS -o /dev/null --connect-timeout 3 \
+           --max-time "$NTFY_AGENT_TIMEOUT" "https://ntfy.sh/v1/health" 2>/dev/null; then
+        printf '  ok    ntfy.sh reachable\n'
+      else
+        warn "cannot reach ntfy.sh" "curl -v https://ntfy.sh/v1/health"
+      fi ;;
+  esac
+
+  oldifs=$IFS; IFS=$NL
+  for u in $(each_url "$NTFY_AGENT_URLS"); do
+    IFS=$oldifs
+    known_scheme "$u" || {
+      printf '  FAIL  unknown destination scheme "%s"\n' "${u%%://*}"
+      printf '        fix: see the scheme list in %s\n' "$CONF"
+      fail=1
+    }
+    IFS=$NL
+  done
+  IFS=$oldifs
+
+  if desktop_ok; then
+    printf '  ok    desktop banner available\n'
+  elif is_remote; then
+    warn "remote or CI session, desktop banner skipped" \
+         "Expected over SSH and in CI. The push to your phone still goes out."
+  else
+    warn "no desktop banner backend on this machine" \
+         "Linux: apt install libnotify-bin. Windows: Install-Module BurntToast"
+  fi
+
+  detected=$(detect_agents)
+  ck "at least one agent detected" \
+     "install Claude Code, Codex, Cursor, Gemini CLI or Copilot CLI first" \
+     test -n "$detected"
+
+  if [ -n "$detected" ]; then
+    # Paths come from the registry, so a newly added agent is checked here
+    # without touching doctor.
+    set --
+    for a in $(agent_ids); do set -- "$@" "$(agent_config_file "$a")"; done
+    ck "hooks wired into at least one agent" "run: ntfy-agent install" \
+       grep -qs "$HOOK_MARKER" "$@"
+  fi
+
+  # Installing the plugin and running `install claude` both wire Claude's Stop
+  # hook. Debounce collapses the duplicate, but the user should know.
+  if grep -qs "$HOOK_MARKER" "$HOME/.claude/settings.json" 2>/dev/null \
+     && grep -qs '"ntfy-agent@' "$HOME/.claude/settings.json" 2>/dev/null; then
+    warn "Claude Code is wired twice, by the plugin and by 'install'" \
+         "debounce collapses the pair, so you get one notification, but keep one: 'ntfy-agent uninstall', or disable the plugin"
+  fi
+
+  snoozed && warn "notifications are snoozed" "ntfy-agent snooze off"
+  within_quiet_hours && warn "inside quiet hours right now" \
+    "finished-turn pings are muted. needs_input still gets through."
+
+  say ""
+  if [ "$fail" = 0 ]; then say "All good. Try: ntfy-agent test"
+  else say "Fix the failures above, then run doctor again."; fi
+  return "$fail"
+}
+
+usage() {
+  cat <<'EOF'
+ntfy-agent: notify your phone when a coding agent finishes a turn or needs you.
+
+  ntfy-agent setup                 write a config with a fresh random topic
+  ntfy-agent install [agent...]    wire hooks into detected agents
+  ntfy-agent test                  send a test notification
+  ntfy-agent status                show config and which agents are wired
+  ntfy-agent doctor                diagnose problems, with a fix for each
+  ntfy-agent snooze [minutes|off]  mute for a while (default 60)
+  ntfy-agent send <title> [body]   send an ad-hoc notification
+  ntfy-agent uninstall             remove hooks, keep config
+  ntfy-agent hook <agent> <role>   internal, called by the agent's own hook
+  ntfy-agent --version             print the version
+
+Config: environment > Claude Code plugin options > config file > defaults
+EOF
+  printf 'Agents: %s\n' "$(agent_list)"
+}
+
+# ------------------------------------------------------------------ main ----
+
+case "${1:-}" in
+  # Belt and braces: never let anything here surface to the agent as output or
+  # as a non-zero exit code. load_config is inside the guard on purpose: it
+  # sources a user-editable file, and a stray quote in that file would otherwise
+  # abort the script with dash's exit 2, the one code that blocks the turn.
+  hook)      shift; { load_config; cmd_hook "$@"; } >/dev/null 2>&1; exit 0 ;;
+  # Internal, spawned by the hook path. Silent and always successful too.
+  # rm on exit as well as inline, so a killed curl cannot leave the request
+  # config, which holds a token, sitting in the state directory.
+  __send)    shift
+             trap 'rm -f "$REQ_CFG" 2>/dev/null' EXIT INT TERM HUP
+             { load_config; cmd__send; } >/dev/null 2>&1; exit 0 ;;
+  setup)     shift; load_config; cmd_setup "$@" ;;
+  install)   shift; load_config; cmd_install "$@" ;;
+  uninstall) shift; load_config; cmd_uninstall "$@" ;;
+  test)      shift; load_config; cmd_test "$@" ;;
+  send)      shift; load_config; cmd_send "$@" ;;
+  status)    shift; load_config; cmd_status "$@" ;;
+  doctor)    shift; load_config; cmd_doctor "$@" ;;
+  snooze)    shift; load_config; cmd_snooze "$@" ;;
+  -v|--version|version) say "ntfy-agent $VERSION" ;;
+  ''|-h|--help|help) usage ;;
+  *) printf 'ntfy-agent: unknown command %s\n\n' "$1" >&2; usage >&2; exit 1 ;;
+esac
