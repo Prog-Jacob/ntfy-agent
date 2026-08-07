@@ -854,9 +854,12 @@ cmd_hook() {
     # deadlocks forever under bash and macOS sh: the command substitution
     # allocates its pipe at the lowest free descriptor, which is 0, so cat waits
     # on its own output. Duplicating fd 0 to fd 3 happens before that pipe
-    # exists, and the dup simply fails when fd 0 is closed, so there is nothing
-    # to detect and nothing to hang on.
-    if exec 3<&0 2>/dev/null; then
+    # exists, so there is nothing to hang on.
+    #
+    # The dup is probed in a subshell because a failed redirection on `exec`, a
+    # special built-in, is fatal: dash quits with 2, the code that blocks a turn.
+    if ( exec 3<&0 ) 2>/dev/null; then
+      exec 3<&0
       PAYLOAD=$(cat <&3 2>/dev/null)
       exec 3<&-
     fi
