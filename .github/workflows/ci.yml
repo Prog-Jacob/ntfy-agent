@@ -63,7 +63,8 @@ jobs:
           # documented plugin root variable.
           jq -e '[.hooks[][].hooks[].command
                   | test("CLAUDE_PLUGIN_ROOT")] | all' hooks/hooks.json > /dev/null
-          curl -fsSL https://claude.ai/install.sh | bash -s -- --yes
+          # The installer's only argument is stable|latest|VERSION.
+          curl -fsSL https://claude.ai/install.sh | bash -s stable
           "$HOME/.local/bin/claude" plugin validate ./
 
   test:
