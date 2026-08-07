@@ -14,7 +14,7 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: shellcheck
         # -s sh is the POSIX dialect the shebangs ask for, and the strictest of
         # the three the suite runs under: anything it accepts, dash and bash do.
@@ -79,7 +79,7 @@ jobs:
             shell: dash
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Running the suite under each shell is the point: the script claims POSIX
       # compatibility, so a bashism has to fail here rather than in someone's
       # dash-on-Debian install.
@@ -89,7 +89,7 @@ jobs:
   test-windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Windows support is Git Bash, which is what Claude Code runs hooks under
       # there, so the POSIX suite is the whole Windows story.
       - name: test under Git Bash
