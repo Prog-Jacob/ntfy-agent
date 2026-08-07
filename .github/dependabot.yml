@@ -1,0 +1,7 @@
+version: 2
+updates:
+  # Actions are pinned to commit SHAs, which nothing else will ever bump.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly

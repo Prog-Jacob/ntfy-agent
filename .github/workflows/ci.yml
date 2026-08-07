@@ -1,0 +1,96 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Nothing here needs to write. Actions are pinned to a commit rather than a tag,
+# since a tag can be moved to point at different code after review.
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: shellcheck
+        # -s sh is the POSIX dialect the shebangs ask for, and the strictest of
+        # the three the suite runs under: anything it accepts, dash and bash do.
+        run: shellcheck -s sh bin/ntfy-agent install.sh test/test.sh
+
+      - name: every subcommand is documented
+        # Checks presence, not layout, so reformatting the README is free while
+        # adding a subcommand and forgetting to document it still fails.
+        run: |
+          missing=0
+          for c in $(sh bin/ntfy-agent --help | awk '/^  ntfy-agent /{print $2}'); do
+            grep -q "ntfy-agent $c" README.md || { echo "undocumented: $c"; missing=1; }
+          done
+          exit $missing
+
+      - name: every setting is documented and offered to the plugin
+        # The settings list lives in conf_keys(). Every entry must reach the
+        # README table, and plugin.json must not name one that does not exist.
+        run: |
+          fail=0
+          keys=$(sed -n '/^conf_keys()/,/^}/p' bin/ntfy-agent \
+                 | tr ' ' '\n' | grep -E '^[A-Z_]+$')
+          for k in $keys; do
+            grep -q "NTFY_AGENT_$k" README.md || { echo "undocumented: $k"; fail=1; }
+          done
+          for k in $(jq -r '.userConfig // {} | keys[]' .claude-plugin/plugin.json); do
+            printf '%s\n' $keys | grep -qix "$k" \
+              || { echo "plugin.json offers unknown setting: $k"; fail=1; }
+          done
+          exit $fail
+
+      - name: one version, everywhere
+        run: |
+          v=$(sed -n 's/^VERSION=//p' bin/ntfy-agent)
+          echo "version $v"
+          test -n "$v"
+          test "$v" = "$(jq -r .version .claude-plugin/plugin.json)"
+          grep -q "^## \[$v\]" CHANGELOG.md
+
+      - name: validate plugin manifests
+        # jq only proves the files parse. The vendor's validator is the one that
+        # checks the schema, and it is what a user's install actually runs.
+        run: |
+          jq -e . hooks/hooks.json > /dev/null
+          # Every hook command must point at the bundled script via the
+          # documented plugin root variable.
+          jq -e '[.hooks[][].hooks[].command
+                  | test("CLAUDE_PLUGIN_ROOT")] | all' hooks/hooks.json > /dev/null
+          curl -fsSL https://claude.ai/install.sh | bash -s -- --yes
+          "$HOME/.local/bin/claude" plugin validate ./
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        shell: [sh, bash, dash]
+        exclude:
+          # dash is not present on the macOS runner.
+          - os: macos-latest
+            shell: dash
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      # Running the suite under each shell is the point: the script claims POSIX
+      # compatibility, so a bashism has to fail here rather than in someone's
+      # dash-on-Debian install.
+      - name: test
+        run: ${{ matrix.shell }} test/test.sh
+
+  test-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      # Windows support is Git Bash, which is what Claude Code runs hooks under
+      # there, so the POSIX suite is the whole Windows story.
+      - name: test under Git Bash
+        shell: bash
+        run: sh test/test.sh
