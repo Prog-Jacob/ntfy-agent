@@ -587,11 +587,18 @@ send_desktop() {
   if [ "$EVENT" = needs_input ]; then icon='🔔'; else icon='✅'; fi
   case "$(platform)" in
     macos)
-      # AppleScript string literals have no escape for arbitrary text, so drop
-      # the only two characters that can break out of one.
-      osascript \
-        -e "display notification \"$(printf '%s' "$BODY" | tr -d '\\"')\" with title \"$icon $(printf '%s' "$TITLE" | tr -d '\\"')\" sound name \"Ping\"" \
-        >/dev/null 2>&1
+      # display notification has no click action, and macOS credits a banner to
+      # whoever ran the script, so clicking one opens Script Editor.
+      if have terminal-notifier; then
+        terminal-notifier -title "$icon $TITLE" -message "$BODY" \
+          -sound Ping ${CLICK:+-open "$CLICK"} >/dev/null 2>&1
+      else
+        # AppleScript string literals have no escape for arbitrary text, so drop
+        # the only two characters that can break out of one.
+        osascript \
+          -e "display notification \"$(printf '%s' "$BODY" | tr -d '\\"')\" with title \"$icon $(printf '%s' "$TITLE" | tr -d '\\"')\" sound name \"Ping\"" \
+          >/dev/null 2>&1
+      fi
       ;;
     windows) win_toast "$icon" ;;
     linux)

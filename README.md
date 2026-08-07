@@ -154,7 +154,8 @@ once, comma separated. Then run `ntfy-agent test`.
 
 A desktop banner also fires where you would see it: Notification Center on
 macOS, `notify-send` on Linux, BurntToast on Windows and WSL. Skipped over SSH
-and in CI.
+and in CI. On macOS a banner is only clickable with `brew install
+terminal-notifier`; AppleScript has no click action, so it opens Script Editor.
 
 > [!NOTE]
 > Discord and Slack are log destinations, not alerts. Neither carries priority.
@@ -216,7 +217,7 @@ through; `snooze` is the only control that silences them.
 | `NTFY_AGENT_QUIET_HOURS` | none | e.g. `23:00-07:00`, local time. Mutes finished turns only |
 | `NTFY_AGENT_BODY` | `summary` | `none` sends the title only |
 | `NTFY_AGENT_MAX_BODY` | `300` | Truncate the message to this many characters |
-| `NTFY_AGENT_CLICK` | none | Tap-through URL; `{cwd}` `{session}` `{agent}` |
+| `NTFY_AGENT_CLICK` | none | Tap-through URL; `{cwd}` `{session}` `{agent}`. macOS banners need `terminal-notifier` |
 | `NTFY_AGENT_DESKTOP` | `auto` | Banner: `auto`, `always`, `never` |
 | `NTFY_AGENT_TIMEOUT` | `5` | Per-request ceiling, in seconds |
 
