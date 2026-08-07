@@ -950,11 +950,18 @@ check "an unknown flag exits non-zero" 1 $?
 sh "$INST" -b >/dev/null 2>&1
 check "a flag missing its argument exits non-zero" 1 $?
 
+# Under Git Bash, curl cannot open the shell's own /d/a/... form of a path.
+file_url() {
+  if command -v cygpath >/dev/null 2>&1; then printf 'file:///%s' "$(cygpath -m "$1")"
+  else printf 'file://%s' "$1"
+  fi
+}
+
 # Serve the real script from disk so the installer never touches the network.
 inst_env() {
   env -i HOME="$TMP/ihome" PATH="$PATH" \
     XDG_CONFIG_HOME="$TMP/ihome/.config" XDG_STATE_HOME="$TMP/ihome/.state" \
-    NTFY_AGENT_BASE_URL="file://$ROOT" "$@"
+    NTFY_AGENT_BASE_URL="$(file_url "$ROOT")" "$@"
 }
 mkdir -p "$TMP/ihome"
 out=$(inst_env sh "$INST" -b "$TMP/ibin" --no-setup 2>&1)
@@ -985,13 +992,13 @@ refute "--uninstall removes the installed script" test -e "$TMP/ibin3/ntfy-agent
 # A corrupt or truncated download must be refused rather than installed.
 mkdir -p "$TMP/badsrc/bin"
 printf '#!/bin/sh\nif true; then\n' >"$TMP/badsrc/bin/ntfy-agent"
-out=$(inst_env NTFY_AGENT_BASE_URL="file://$TMP/badsrc" sh "$INST" \
+out=$(inst_env NTFY_AGENT_BASE_URL="$(file_url "$TMP/badsrc")" sh "$INST" \
   -b "$TMP/badbin" --no-setup 2>&1)
 check "an incomplete download is refused" 1 $?
 refute "an incomplete download installs nothing" test -e "$TMP/badbin/ntfy-agent"
 
 printf '<html>404</html>\n' >"$TMP/badsrc/bin/ntfy-agent"
-inst_env NTFY_AGENT_BASE_URL="file://$TMP/badsrc" sh "$INST" \
+inst_env NTFY_AGENT_BASE_URL="$(file_url "$TMP/badsrc")" sh "$INST" \
   -b "$TMP/badbin2" --no-setup >/dev/null 2>&1
 check "an error page is not installed as a script" 1 $?
 
